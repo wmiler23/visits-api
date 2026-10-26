@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GitHub Actions CI/CD bootstrap, environment level. Deploy once per environment
+  (dev, prod) by hand, with admin credentials: the CloudFormation execution role,
+  the permissions boundary for workload roles, and the role GitHub assumes to deploy.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: visits
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+  OidcProviderArn:
+    Type: String
+    Description: OidcProviderArn output of the account bootstrap stack.
+  GitHubOwner:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+    Description: GitHub user or organization that owns the repository (exact case).
+  GitHubOwnerId:
+    Type: String
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of that owner (gh api repos/OWNER/REPO --jq .owner.id).
+  GitHubRepo:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9._-]+$"
+    Description: Repository name (exact case).
+  GitHubRepoId:
+    Type: String
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of the repository (gh api repos/OWNER/REPO --jq .id).
+  ArtifactBucketName:
+    Type: String
+    Description: ArtifactBucketName output of the account bootstrap stack.
+  ArtifactWriter:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Whether this environment's deploy role uploads Lambda bundles. Only the first environment in the chain (dev) does.
+
+Conditions:
+  CanWriteArtifacts: !Equals [!Ref ArtifactWriter, "true"]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Ceiling for every role the app template creates (today: the Lambda role).
+  # The execution role can only create roles that carry this boundary.
+  # ---------------------------------------------------------------------------
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-${Environment}-workload-boundary
+      Description: Maximum permissions for workload roles created by the app stack.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AppTables
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:ConditionCheckItem
+              - dynamodb:DescribeTable
+            Resource:
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppName}-${Environment}-*
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppName}-${Environment}-*/index/*
+          - Sid: AppLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppName}-${Environment}-*
+          - Sid: Tracing
+            Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # The only principal that creates or changes app resources. CloudFormation
+  # assumes it; GitHub never holds these permissions directly.
+  # ---------------------------------------------------------------------------
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-${Environment}-cfn-exec
+      Description: CloudFormation service role for the app stack in this environment.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: manage-app-resources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDbTables
+                Effect: Allow
+                Action: dynamodb:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AppName}-${Environment}-*
+              - Sid: LambdaFunctions
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-${Environment}-*
+              - Sid: LogGroups
+                Effect: Allow
+                Action: logs:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AppName}-${Environment}-*
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: HttpApis
+                # API IDs are random, so HTTP APIs cannot be scoped by name.
+                # Separate AWS accounts per environment remove this overlap.
+                Effect: Allow
+                Action: apigateway:*
+                Resource:
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*
+                  - !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*
+              - Sid: CreateBoundedWorkloadRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-${Environment}-*
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: ManageWorkloadRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:DeleteRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListInstanceProfilesForRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-${Environment}-*
+              - Sid: PassWorkloadRolesToLambda
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-${Environment}-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+              - Sid: KeepTheBoundary
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: "*"
+              - Sid: NeverModifySelf
+                # This role's own name matches the pattern above, so without this
+                # a template could grant the execution role anything it liked.
+                Effect: Deny
+                Action: iam:*
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-${Environment}-cfn-exec
+              - Sid: ReadLambdaBundles
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/artifacts/*
+
+  # ---------------------------------------------------------------------------
+  # What GitHub Actions assumes. It can ask CloudFormation to deploy this one
+  # stack with the execution role above, and touch bundles in S3. Nothing else.
+  # ---------------------------------------------------------------------------
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gha-deploy-${Environment}
+      Description: !Sub Assumed by GitHub Actions jobs running in the ${Environment} environment.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubEnvironmentOnly
+            Effect: Allow
+            Principal:
+              Federated: !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Both subject formats, pinned to this repository. Repos created
+                # after 15 July 2026 send the first; older repos send the second.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:environment:${Environment}
+                  - !Sub repo:${GitHubOwner}/${GitHubRepo}:environment:${Environment}
+      Policies:
+        - PolicyName: deploy-app-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CreateChangeSetsWithExecRoleOnly
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-${Environment}/*
+                Condition:
+                  StringEquals:
+                    cloudformation:RoleArn: !GetAtt CfnExecRole.Arn
+              - Sid: RunAndWatchChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary  # 'deploy' calls it before every update
+                  - cloudformation:TagResource
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-${Environment}/*
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*/*
+              - Sid: PassExecRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: ListBundles
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix: artifacts/*
+              - Sid: ReadBundles
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/artifacts/*
+              - !If
+                - CanWriteArtifacts
+                - Sid: UploadBundles
+                  Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/artifacts/*
+                - !Ref AWS::NoValue
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+  CfnExecRoleArn:
+    Value: !GetAtt CfnExecRole.Arn
+  WorkloadBoundaryArn:
+    Value: !Ref WorkloadBoundary

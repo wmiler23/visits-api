@@ -1,0 +1,138 @@
+name: Deploy
+
+# main -> CI -> build one bundle -> dev + smoke test -> prod + smoke test.
+# No manual step: prod starts as soon as dev has passed.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, never cancelled midway. A newer push waits in line;
+# if several pile up, GitHub keeps only the newest pending run.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'visits' }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+  ARTIFACT_KEY: artifacts/${{ github.sha }}/app.zip
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build bundle
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Package Lambda code
+        run: python scripts/package.py dist/app.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lambda-bundle
+          path: dist/app.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy-dev:
+    name: Deploy dev
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.api_url }}
+    permissions:
+      contents: read
+      id-token: write   # lets this job request a GitHub OIDC token
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: lambda-bundle
+          path: dist
+
+      - name: Assume the dev deploy role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}-dev
+          mask-aws-account-id: true
+
+      - name: Publish bundle to S3
+        run: scripts/publish_bundle.sh dist/app.zip
+
+      - name: Deploy stack
+        id: deploy
+        env:
+          APP_VERSION: ${{ github.sha }}
+        run: scripts/deploy.sh dev
+
+      - name: Smoke test
+        env:
+          SMOKE_WRITE: "true"
+          API_URL: ${{ steps.deploy.outputs.api_url }}
+        run: scripts/smoke_test.sh "$API_URL" "$GITHUB_SHA"
+
+  deploy-prod:
+    name: Deploy prod
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: prod   # admits main only; holds the prod role ARN
+      url: ${{ steps.deploy.outputs.api_url }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Assume the prod deploy role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}-prod
+          mask-aws-account-id: true
+
+      - name: Confirm the bundle dev tested is in S3
+        run: |
+          aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$ARTIFACT_KEY" \
+            --query '{bytes: ContentLength, commit: Metadata.commit}' --output table
+
+      - name: Deploy stack
+        id: deploy
+        env:
+          APP_VERSION: ${{ github.sha }}
+        run: scripts/deploy.sh prod
+
+      - name: Smoke test (read-only)
+        env:
+          API_URL: ${{ steps.deploy.outputs.api_url }}
+        run: scripts/smoke_test.sh "$API_URL" "$GITHUB_SHA"

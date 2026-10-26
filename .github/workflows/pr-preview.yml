@@ -1,0 +1,63 @@
+name: PR preview
+
+# For pull requests that touch infrastructure: create a CloudFormation change
+# set against the dev stack, post the diff on the PR, delete the change set.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "scripts/preview_changeset.sh"
+      - "scripts/render_changeset.py"
+      - "scripts/comment_on_pr.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  changeset:
+    name: CloudFormation change set
+    # Fork PRs get no OIDC token or secrets, so only run for branches in this repo.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write       # OIDC token, subject ...:pull_request
+      pull-requests: write  # post the comment
+    env:
+      APP_NAME: ${{ vars.APP_NAME || 'visits' }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Assume the preview role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_PREVIEW_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}-preview
+          mask-aws-account-id: true
+
+      - name: Create change set and render it
+        run: scripts/preview_changeset.sh preview.md
+
+      - name: Add to job summary
+        if: always() && hashFiles('preview.md') != ''
+        run: cat preview.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the pull request
+        if: always() && hashFiles('preview.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Updates the comment that starts with the same <!-- cfn-preview --> marker,
+        # so each push edits one comment instead of adding another.
+        run: scripts/comment_on_pr.sh "$PR_NUMBER" preview.md

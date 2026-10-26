@@ -1,0 +1,9 @@
+# Tools for linting and testing, locally and in CI. Exact pins keep CI repeatable;
+# Dependabot (.github/dependabot.yml) proposes upgrades as pull requests.
+# The Lambda runtime already includes boto3, so nothing here ships to AWS.
+cfn-lint==1.58.0
+pytest==9.1.1
+boto3==1.43.118
+moto[dynamodb]==5.2.4
+actionlint-py==1.7.12.25
+shellcheck-py==0.11.0.1

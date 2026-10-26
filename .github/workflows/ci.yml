@@ -1,0 +1,68 @@
+name: CI
+
+# Runs on every pull request (no path filters: these are required checks, and a
+# skipped required check blocks the merge). deploy.yml also calls this workflow
+# so nothing reaches AWS without passing the same checks.
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per PR; a new push cancels the outdated run. When called from
+  # deploy.yml the group includes that run's ID, so it never cancels a deploy.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install tools
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Lint CloudFormation templates
+        run: make lint-cfn
+
+      - name: Lint shell scripts
+        run: make lint-sh
+
+      - name: Lint workflows
+        run: make lint-workflows
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install tools
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: make test

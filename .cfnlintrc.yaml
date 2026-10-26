@@ -1,0 +1,7 @@
+# cfn-lint reads this file when run with no arguments (make lint-cfn).
+templates:
+  - infra/template.yaml
+  - bootstrap/*.yaml
+# Validate against the region you deploy to. Add more regions if you deploy to several.
+regions:
+  - us-east-1

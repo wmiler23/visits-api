@@ -1,0 +1,12 @@
+[project]
+name = "visits-api"
+version = "0.1.0"
+description = "Course project: GitHub Actions CI/CD to AWS with CloudFormation"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The Lambda bundle puts handler.py at the zip root, so tests import it the same way.
+# scripts/ holds the pipeline's own Python helpers, which are tested too.
+pythonpath = ["src/app", "scripts"]
+addopts = "-q"

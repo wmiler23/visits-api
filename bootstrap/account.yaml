@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GitHub Actions CI/CD bootstrap, account level. Deploy once per AWS account,
+  by hand, with admin credentials: GitHub OIDC provider, artifact bucket, and
+  the read-only role that pull requests use to preview CloudFormation changes.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: visits
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  GitHubOwner:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9-]+$"
+    Description: GitHub user or organization that owns the repository (exact case).
+  GitHubOwnerId:
+    Type: String
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of that owner (gh api repos/OWNER/REPO --jq .owner.id).
+  GitHubRepo:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9._-]+$"
+    Description: Repository name (exact case).
+  GitHubRepoId:
+    Type: String
+    AllowedPattern: "^[0-9]+$"
+    Description: Numeric ID of the repository (gh api repos/OWNER/REPO --jq .id).
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of a token.actions.githubusercontent.com provider that already exists in
+      this account (an account can hold only one). Leave empty to create it here.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # ThumbprintList is omitted on purpose. IAM validates GitHub's tokens
+      # against its own trusted CA library, so thumbprints are no longer needed.
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    # Name left to CloudFormation: globally unique and free of the account ID,
+    # so it can sit in a public GitHub variable.
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: tidy-up
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  PreviewRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gha-preview
+      Description: Assumed by pull request workflows to preview changes to the dev stack. Cannot execute anything.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubPullRequestsOnly
+            Effect: Allow
+            Principal:
+              Federated: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Both subject formats, pinned to this repository. Repos created
+                # after 15 July 2026 send the first; older repos send the second.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:pull_request
+                  - !Sub repo:${GitHubOwner}/${GitHubRepo}:pull_request
+      Policies:
+        - PolicyName: preview-change-sets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDevStack
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-dev/*
+              - Sid: PreviewChangeSetsOnly
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-dev/*
+                Condition:
+                  StringLike:
+                    cloudformation:ChangeSetName: preview-*
+              - Sid: PassDevExecRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-dev-cfn-exec
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+Outputs:
+  OidcProviderArn:
+    Value: !If [CreateOidcProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  PreviewRoleArn:
+    Value: !GetAtt PreviewRole.Arn

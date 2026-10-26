@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Visits API: API Gateway HTTP API -> Lambda (Python 3.13, arm64) -> DynamoDB.
+  Deployed per environment by GitHub Actions through the CloudFormation execution role.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: visits
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+    Description: Prefix for every resource name. Must match the bootstrap stacks.
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket holding Lambda bundles (output of the account bootstrap stack).
+  ArtifactKey:
+    Type: String
+    AllowedPattern: "^artifacts/.+\\.zip$"
+    Description: Object key of the bundle, artifacts/<commit-sha>/app.zip.
+  AppVersion:
+    Type: String
+    Default: local
+    Description: Commit SHA being deployed. Returned by GET /health so smoke tests can confirm the rollout.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+  LambdaMemoryMb:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+  ThrottleRateLimit:
+    Type: Number
+    Default: 5
+    Description: Steady-state requests per second allowed on every route.
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 10
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  VisitsTable:
+    Type: AWS::DynamoDB::Table
+    # Delete with the stack. In prod, DeletionProtectionEnabled below makes the
+    # delete fail until someone turns protection off on purpose (Module 9).
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AppName}-${Environment}-visits
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      # Prod keeps backups and refuses deletion; dev stays disposable.
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+
+  HandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AppName}-${Environment}-handler
+      RetentionInDays: !Ref LogRetentionDays
+
+  HandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-${Environment}-handler-role
+      # The execution role may only create roles that carry this boundary
+      # (see bootstrap/environment.yaml), so a template change can never
+      # grant the function more than the boundary allows.
+      PermissionsBoundary: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${AppName}-${Environment}-workload-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CounterReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt VisitsTable.Arn
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt HandlerLogGroup.Arn
+
+  HandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Environment}-handler
+      Description: Visits API request handler
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: handler.handler
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 10
+      Role: !GetAtt HandlerRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      LoggingConfig:
+        LogGroup: !Ref HandlerLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref VisitsTable
+          APP_ENV: !Ref Environment
+          APP_VERSION: !Ref AppVersion
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AppName}-${Environment}-http-api
+      ProtocolType: HTTP
+      Description: Visits API
+
+  HandlerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt HandlerFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 10000
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /health
+      Target: !Sub integrations/${HandlerIntegration}
+
+  GetVisitsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /visits
+      Target: !Sub integrations/${HandlerIntegration}
+
+  PostVisitsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /visits
+      Target: !Sub integrations/${HandlerIntegration}
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref ThrottleRateLimit
+        ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HandlerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API (the $default stage has no path prefix).
+    Value: !GetAtt HttpApi.ApiEndpoint
+  FunctionName:
+    Value: !Ref HandlerFunction
+  TableName:
+    Value: !Ref VisitsTable

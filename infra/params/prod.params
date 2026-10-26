@@ -1,0 +1,7 @@
+# Stack parameters for the prod environment, one Key=Value per line.
+# AppName, Environment, ArtifactBucket, ArtifactKey and AppVersion are
+# supplied by scripts/deploy.sh at deploy time, so they are not listed here.
+LogRetentionDays=30
+LambdaMemoryMb=256
+ThrottleRateLimit=20
+ThrottleBurstLimit=40
